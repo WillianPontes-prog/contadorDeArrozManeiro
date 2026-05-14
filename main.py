@@ -39,28 +39,42 @@ IMAGES = [
 
 def binarize(img):
     """
-    Binariza a imagem destacando apenas as regiões mais claras (arroz).
+    Binariza a imagem detectando mudanças ABRUPTAS de intensidade.
+    Isso elimina luzes com degradê suave e detecta bordas do arroz vs fundo.
     
     Args:
         img: Imagem original em escala BGR
     
     Returns:
-        Imagem binarizada (preto e branco)
+        Imagem binarizada baseada em gradientes (contornos)
     """
     # Converte para escala de cinza
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Suaviza ruído sem destruir tanto as bordas dos grãos
-    blurred = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    # Suaviza ruído sem destruir as bordas do arroz
+    blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
     
-    # Mantém somente os pixels mais claros (arroz) via limiar automático (Otsu)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Calcula os gradientes usando Sobel (derivadas em X e Y)
+    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
     
-    # Limpa pequenos pontos e fecha falhas em regiões do arroz
+    # Calcula a magnitude do gradiente (força da mudança de intensidade)
+    magnitude = cv2.magnitude(sobelx, sobely)
+    
+    # Normaliza para 0-255
+    magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
+    
+    # Aplica threshold para detectar apenas mudanças significativas (bordas fortes)
+    # Valores altos = mudanças abruptas (arroz vs fundo)
+    # Valores baixos = mudanças suaves (luzes com degradê)
+    # Threshold de 120: apenas as mudanças mais abruptas são consideradas bordas
+    _, binary = cv2.threshold(magnitude, 65, 255, cv2.THRESH_BINARY)
+    
+    # Aplica erosão e dilatação para limpar ruído e conectar regiões
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-    
+
     return binary
 
 def count(img):
@@ -81,6 +95,42 @@ def count(img):
     grain_count = sum(1 for c in contours if cv2.contourArea(c) >= MIN_AREA)
     
     return grain_count, binary
+
+
+def visualize_gradient_detection(img):
+    """
+    Visualiza o processo de detecção de gradientes (contornos com mudanças abruptas).
+    
+    Args:
+        img: Imagem original em escala BGR
+    
+    Returns:
+        Tupla com (gray, magnitude, binary)
+    """
+    # Converte para escala de cinza
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Suaviza ruído
+    blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
+    
+    # Calcula os gradientes usando Sobel
+    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    
+    # Calcula a magnitude do gradiente
+    magnitude = cv2.magnitude(sobelx, sobely)
+    magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
+    
+    # Binariza baseado nos gradientes (threshold 120: mudanças muito abruptas)
+    _, binary = cv2.threshold(magnitude, 120, 255, cv2.THRESH_BINARY)
+    
+    # Morfologia
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    
+    return gray, magnitude, binary
+
 
 
 # ========================================================================================== #
@@ -128,6 +178,45 @@ def show_image_pipeline(filename: str, original, binary):
     print(f"  - Janela 'Original': imagem bruta")
     print(f"  - Janela 'Binarizada': resultado do processamento")
     print(f"Pressione qualquer tecla para fechar as janelas e voltar ao menu.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def show_gradient_pipeline(filename: str, original, gray, magnitude, binary):
+    """
+    Exibe o processo completo de detecção de gradientes.
+    Mostra: cinza, mapa de gradientes, e resultado binarizado.
+    
+    Args:
+        filename: Nome do arquivo
+        original: Imagem original (BGR)
+        gray: Imagem em escala de cinza
+        magnitude: Mapa de gradientes (magnitude do vetor gradiente)
+        binary: Imagem binarizada final
+    """
+    # Exibe a imagem original
+    cv2.imshow(f"01 - Original - {filename}", original)
+    
+    # Exibe a escala de cinza
+    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"02 - Escala de Cinza - {filename}", gray_bgr)
+    
+    # Exibe o mapa de gradientes (forças de mudança)
+    magnitude_bgr = cv2.cvtColor(magnitude, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"03 - Mapa de Gradientes - {filename}", magnitude_bgr)
+    
+    # Exibe a imagem binarizada
+    binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"04 - Binarizada (Contornos) - {filename}", binary_bgr)
+    
+    print(f"\n🎯 Detecção de Gradientes - {filename}:")
+    print(f"  - Janela '01 Original': imagem bruta")
+    print(f"  - Janela '02 Escala de Cinza': conversão inicial")
+    print(f"  - Janela '03 Mapa de Gradientes': mostra força das mudanças de intensidade")
+    print(f"    ✓ Branco = mudanças abruptas (bordas do arroz vs fundo)")
+    print(f"    ✗ Preto = mudanças suaves (degradê das luzes - ELIMINADAS)")
+    print(f"  - Janela '04 Binarizada': contornos finais detectados")
+    print(f"Pressione qualquer tecla para fechar as janelas.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
@@ -188,11 +277,16 @@ def main():
             # Conta os grãos e recebe a imagem binarizada
             contado, binary = count(img)
             
+            # Extrai dados para visualização de gradientes
+            gray, magnitude, _ = visualize_gradient_detection(img)
+            
             # Armazena os dados das imagens
             images_data.append({
                 "arquivo": filename,
                 "original": img,
-                "binary": binary
+                "binary": binary,
+                "gray": gray,
+                "magnitude": magnitude
             })
             
             # Valida o resultado
@@ -226,15 +320,34 @@ def main():
             else:
                 idx = int(choice)
                 if 0 <= idx < len(images_data):
-                    show_image_pipeline(
-                        images_data[idx]['arquivo'],
-                        images_data[idx]['original'],
-                        images_data[idx]['binary']
-                    )
+                    data = images_data[idx]
+                    print("\n📊 Opções de visualização:")
+                    print("  1: Visualizar resultado final (binarização)")
+                    print("  2: Visualizar processo de detecção de gradientes")
+                    
+                    view_choice = input("Escolha (1 ou 2): ").strip()
+                    
+                    if view_choice == "1":
+                        show_image_pipeline(
+                            data['arquivo'],
+                            data['original'],
+                            data['binary']
+                        )
+                    elif view_choice == "2":
+                        show_gradient_pipeline(
+                            data['arquivo'],
+                            data['original'],
+                            data['gray'],
+                            data['magnitude'],
+                            data['binary']
+                        )
+                    else:
+                        print("❌ Escolha inválida. Use 1 ou 2.")
                 else:
                     print(f"❌ Por favor, insira um número entre 0 e {len(images_data)-1}, 'table' ou 'exit'")
         except ValueError:
             print("❌ Por favor, insira um número, 'table' ou 'exit'")
+
 
 if __name__ == "__main__":
     main()
