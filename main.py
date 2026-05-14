@@ -17,6 +17,7 @@ Infos legais 👍
 
 from pathlib import Path
 import cv2
+import numpy as np
 
 
 # Define de parâmetros
@@ -79,22 +80,96 @@ def binarize(img):
 
 def count(img):
     """
-    Método de contagem de grãos.
-    
+    Método de contagem de grãos usando máscara dilatada e binarização local.
+
     Args:
         img: Imagem original (BGR)
-    
+
     Returns:
-        Tupla com (quantidade_de_grãos, imagem_binarizada)
+        Tupla com (quantidade_de_grãos, binario_local, bordas, erodido, mascara)
     """
-    # Binariza a imagem
-    binary = binarize(img)
-    
-    # Encontra contornos e conta grãos
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Primeiro detecta as bordas base.
+    edges = binarize(img)
+
+    # Limpa ruído antes de formar a máscara.
+    eroded = erode_borders(edges)
+
+    # A máscara vem da dilatação dos blobs brancos.
+    mask = fill_borders(eroded)
+
+    # Faz a binarização local por blob usando o gray original.
+    binary = local_binarize_by_mask(gray, mask)
+
+    # Encontra contornos e conta grãos.
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     grain_count = sum(1 for c in contours if cv2.contourArea(c) >= MIN_AREA)
-    
-    return grain_count, binary
+
+    return grain_count, binary, edges, eroded, mask
+
+
+def fill_borders(edges):
+    """
+    Dilata as bordas para criar uma máscara por blob.
+
+    Args:
+        edges: Imagem binarizada com as bordas (contornos)
+
+    Returns:
+        Máscara dilatada com os blobs unidos o suficiente para a análise local
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    filled = cv2.dilate(edges, kernel, iterations=1)
+    filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return filled
+
+
+def erode_borders(edges):
+    """
+    Aplica erosão nas bordas para limpar ruídos e peças pequenas.
+
+    Args:
+        edges: Imagem binarizada com as bordas (contornos)
+
+    Returns:
+        Imagem erodida (ruídos removidos)
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    eroded = cv2.erode(edges, kernel, iterations=1)
+    return eroded
+
+
+def local_binarize_by_mask(gray, mask):
+    """
+    Binariza localmente cada blob branco da máscara usando a imagem gray original.
+    O limiar de cada blob é calculado como media + desvio padrao.
+
+    Args:
+        gray: Imagem em escala de cinza original
+        mask: Máscara binária com os blobs brancos separados
+
+    Returns:
+        Imagem binária final, calculada blob a blob
+    """
+    result = np.zeros_like(gray)
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    for label in range(1, labels_count):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < MIN_AREA:
+            continue
+
+        component_mask = cv2.compare(labels, label, cv2.CMP_EQ)
+        mean, stddev = cv2.meanStdDev(gray, mask=component_mask)
+        threshold = float(mean[0][0] + stddev[0][0])
+        threshold = max(0.0, min(255.0, threshold))
+
+        _, local_binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        local_binary = cv2.bitwise_and(local_binary, component_mask)
+        result = cv2.bitwise_or(result, local_binary)
+
+    return result
 
 
 def visualize_gradient_detection(img):
@@ -178,6 +253,43 @@ def show_image_pipeline(filename: str, original, binary):
     print(f"  - Janela 'Original': imagem bruta")
     print(f"  - Janela 'Binarizada': resultado do processamento")
     print(f"Pressione qualquer tecla para fechar as janelas e voltar ao menu.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def show_filled_borders(filename: str, original, edges, eroded, mask, binary):
+    """
+    Exibe a sequência completa: bordas detectadas -> erodidas -> máscara -> binarização local.
+    
+    Args:
+        filename: Nome do arquivo
+        original: Imagem original (BGR)
+        edges: Imagem com as bordas detectadas
+        eroded: Imagem após erosão (ruídos removidos)
+        mask: Máscara dilatada usada na binarização local
+        binary: Binarização local final
+    """
+    cv2.imshow(f"01 - Original - {filename}", original)
+
+    edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"02 - Bordas Detectadas - {filename}", edges_bgr)
+
+    eroded_bgr = cv2.cvtColor(eroded, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"03 - Bordas Erodidas - {filename}", eroded_bgr)
+
+    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"04 - Mascara Diluida - {filename}", mask_bgr)
+
+    binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    cv2.imshow(f"05 - Binarizacao Local - {filename}", binary_bgr)
+
+    print(f"\n🎨 Binarizacao Local por Blob - {filename}:")
+    print(f"  - Janela '01 Original': imagem bruta")
+    print(f"  - Janela '02 Bordas Detectadas': resposta inicial do detector")
+    print(f"  - Janela '03 Bordas Erodidas': limpa ruídos pequenos")
+    print(f"  - Janela '04 Mascara Diluida': blobs unidos para analise local")
+    print(f"  - Janela '05 Binarizacao Local': threshold por blob usando media + desvio padrao")
+    print(f"Pressione qualquer tecla para fechar as janelas.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
@@ -274,8 +386,8 @@ def main():
             # Carrega a imagem
             img = load_image(filename)
             
-            # Conta os grãos e recebe a imagem binarizada
-            contado, binary = count(img)
+            # Conta os grãos e recebe a imagem binarizada local final
+            contado, binary, edges, eroded, mask = count(img)
             
             # Extrai dados para visualização de gradientes
             gray, magnitude, _ = visualize_gradient_detection(img)
@@ -285,6 +397,9 @@ def main():
                 "arquivo": filename,
                 "original": img,
                 "binary": binary,
+                "edges": edges,
+                "eroded": eroded,
+                "mask": mask,
                 "gray": gray,
                 "magnitude": magnitude
             })
@@ -324,8 +439,9 @@ def main():
                     print("\n📊 Opções de visualização:")
                     print("  1: Visualizar resultado final (binarização)")
                     print("  2: Visualizar processo de detecção de gradientes")
+                    print("  3: Visualizar bordas preenchidas")
                     
-                    view_choice = input("Escolha (1 ou 2): ").strip()
+                    view_choice = input("Escolha (1, 2 ou 3): ").strip()
                     
                     if view_choice == "1":
                         show_image_pipeline(
@@ -341,8 +457,17 @@ def main():
                             data['magnitude'],
                             data['binary']
                         )
+                    elif view_choice == "3":
+                        show_filled_borders(
+                            data['arquivo'],
+                            data['original'],
+                            data['edges'],
+                            data['eroded'],
+                            data['mask'],
+                            data['binary']
+                        )
                     else:
-                        print("❌ Escolha inválida. Use 1 ou 2.")
+                        print("❌ Escolha inválida. Use 1, 2 ou 3.")
                 else:
                     print(f"❌ Por favor, insira um número entre 0 e {len(images_data)-1}, 'table' ou 'exit'")
         except ValueError:
