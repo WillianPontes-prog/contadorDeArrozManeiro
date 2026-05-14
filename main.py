@@ -78,7 +78,7 @@ def binarize(img):
 
     return binary
 
-def count(img):
+def count(img, rel_thresh_override=None, percentile_override=None, alpha_override=None):
     """
     Método de contagem de grãos usando máscara dilatada e binarização local.
 
@@ -107,11 +107,87 @@ def count(img):
     binary = cv2.erode(binary, kernel_final, iterations=1)
     binary = cv2.dilate(binary, kernel_final, iterations=1)
 
-    # Encontra contornos e conta grãos.
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    grain_count = sum(1 for c in contours if cv2.contourArea(c) >= MIN_AREA)
+    # Primeiro calcule áreas por componente para definir área típica
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    areas = []
+    for lbl in range(1, num_labels):
+        a = int(stats[lbl, cv2.CC_STAT_AREA])
+        if a >= MIN_AREA:
+            areas.append(a)
 
-    return grain_count, binary, edges, eroded, mask
+    if len(areas) == 0:
+        return 0, binary, edges, eroded, mask
+
+    areas_arr = np.array(areas, dtype=np.float32)
+    pct = 60 if percentile_override is None else int(percentile_override)
+    p60 = np.percentile(areas_arr, pct)
+    small_areas = areas_arr[areas_arr <= p60]
+    if small_areas.size > 0:
+        typical_area = float(np.median(small_areas))
+    else:
+        typical_area = float(np.median(areas_arr))
+    typical_area = max(1.0, typical_area)
+    # threshold relativo usado para detectar picos (semente)
+    rel_thresh = 0.20 if rel_thresh_override is None else float(rel_thresh_override)
+
+    # Distance transform sobre toda a máscara
+    # Antes do distance transform, tente separar componentes muito grandes
+    # usamos uma versão mais sensível do rel_thresh para gerar sementes locais
+    binary = split_large_components_watershed(img, binary, labels, stats, typical_area, rel_thresh=(rel_thresh * 0.6))
+
+    bin8 = (binary > 0).astype('uint8') * 255
+
+    # Recalcula componentes após possível separação por watershed
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin8, connectivity=8)
+
+    dist = cv2.distanceTransform(bin8, cv2.DIST_L2, 5)
+    maxd = dist.max() if dist.size else 0.0
+
+    # Rel threshold menor para ser mais sensível
+    rel_thresh = 0.20 if rel_thresh_override is None else float(rel_thresh_override)
+    th = maxd * rel_thresh
+
+    kernel_local = np.ones((3, 3), dtype=np.uint8)
+    dil = cv2.dilate(dist, kernel_local)
+    peaks = (dist == dil) & (dist >= th)
+    peaks_u8 = (peaks.astype('uint8') * 255)
+    peaks_u8 = cv2.morphologyEx(peaks_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
+    n_peaks, labels_peaks = cv2.connectedComponents(peaks_u8)
+
+    # Para cada componente da imagem binária, conte sementes dentro dele.
+    total = 0
+    for lbl in range(1, num_labels):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < MIN_AREA:
+            continue
+
+        comp_mask = (labels == lbl)
+
+        # número de picos nessa componente
+        # labels_peaks tem rótulos para picos; contamos os que estão dentro do comp_mask
+        peaks_in_comp = 0
+        if n_peaks > 1:
+            # para eficiência, somamos onde labels_peaks>0 e comp_mask True
+            peaks_in_comp = int(np.unique(labels_peaks[comp_mask]).shape[0] - (1 if 0 in np.unique(labels_peaks[comp_mask]) else 0))
+
+        if peaks_in_comp >= 1:
+            total += peaks_in_comp
+        else:
+            # fallback by area (para componentes grandes conectados)
+            est = int(round(area / typical_area))
+            if est < 1:
+                est = 1
+            total += est
+
+    # Também calcule uma estimativa global por área e combine
+    total_pixels = float(np.sum(areas_arr))
+    area_estimate = int(round(total_pixels / typical_area))
+
+    # Combina as duas estimativas (sementes e área) usando ponderação alpha
+    alpha = 0.6 if alpha_override is None else float(alpha_override)
+    final_estimate = int(round(alpha * float(total) + (1.0 - alpha) * float(area_estimate)))
+
+    return final_estimate, binary, edges, eroded, mask
 
 
 def fill_borders(edges):
@@ -175,6 +251,85 @@ def local_binarize_by_mask(gray, mask):
         result = cv2.bitwise_or(result, local_binary)
 
     return result
+
+
+def split_large_components_watershed(img_bgr, binary, labels, stats, typical_area, rel_thresh=0.18):
+    """
+    Tenta separar componentes muito grandes usando watershed com marcas baseadas em picos
+
+    Args:
+        img_bgr: imagem BGR original (usada como entrada para watershed)
+        binary: imagem binária atual (0/255)
+        labels: rótulos dos componentes atuais
+        stats: estatísticas dos componentes atuais (output do connectedComponentsWithStats)
+        typical_area: área típica de um grão (float)
+        rel_thresh: fração do máximo da distance transform para considerar picos
+
+    Returns:
+        binary_mod: nova imagem binária onde grandes componentes podem ter sido separados
+    """
+    binary_mod = binary.copy()
+    h, w = binary.shape[:2]
+
+    # limite de área para considerar um componente 'grande'
+    large_factor = 1.8
+    for lbl in range(1, stats.shape[0]):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area <= int(large_factor * typical_area):
+            continue
+
+        # máscara do componente
+        comp_mask = (labels == lbl).astype('uint8') * 255
+
+        # distancia dentro do componente
+        dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
+        if dist.max() <= 0:
+            continue
+
+        # detecta picos locais na distância (marcadores para watershed)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        dil = cv2.dilate(dist, k)
+        peaks = (dist == dil) & (dist >= (dist.max() * rel_thresh))
+        peaks_u8 = (peaks.astype('uint8') * 255)
+        peaks_u8 = cv2.morphologyEx(peaks_u8, cv2.MORPH_OPEN, k, iterations=1)
+
+        n_markers, markers = cv2.connectedComponents(peaks_u8)
+        if n_markers <= 1:
+            # não encontrou sementes suficientes para separar
+            continue
+
+        # prepara marcador para watershed: rotulos >0
+        marker_img = np.zeros((h, w), dtype=np.int32)
+        # atribui rótulos dos marcadores (1..n_markers-1)
+        marker_img[peaks_u8 > 0] = markers[peaks_u8 > 0]
+
+        # imagem de entrada para watershed: região da componente recortada sobre o BGR original
+        region = cv2.bitwise_and(img_bgr, img_bgr, mask=comp_mask)
+
+        # watershed modifica marker_img in-place
+        try:
+            cv2.watershed(region, marker_img)
+        except Exception:
+            # fallback: ignora se watershed falhar
+            continue
+
+        # markers > 1 correspondem a regiões separadas (watershed usa -1 para borda)
+        unique_markers = np.unique(marker_img)
+        # ignora -1 e 0
+        new_comp = np.zeros_like(comp_mask)
+        for m in unique_markers:
+            if m <= 0:
+                continue
+            mask_m = (marker_img == m).astype('uint8') * 255
+            # adiciona região separada ao novo componente
+            new_comp = cv2.bitwise_or(new_comp, mask_m)
+
+        # substitui a área do componente original pela nova separação
+        # remove a região antiga e cola a nova
+        binary_mod[comp_mask > 0] = 0
+        binary_mod[new_comp > 0] = 255
+
+    return binary_mod
 
 
 def visualize_gradient_detection(img):
