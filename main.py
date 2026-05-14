@@ -3,16 +3,54 @@ Estimador de grãos de arroz em imagens BMP.
 
 Infos legais 👍
 
-1. 🤥 Cada emoji foi posicionado com cuidado por mim, isso não é coisa de IA, bom deixar claro, 
-    estou pondo um pouco mais de trabalho nesse trabalho 4 em especifico, então vou tentar comentar
-    um pouco mais bonitinho (sim esse texto todo é pra eu usar emojis sem ficar estranho).
+1. 🤥 Cada emoji foi posicionado com cuidado por mim, isso não é coisa de IA,
+    achei bom deixar claro isso. Estou tentando comentar esse trabalho de forma 
+    um pouco mais organizada e engraçadinha
 
-2. 📚 Para adicionar mais imagens nos testes, basta editar a lista 'IMAGES' no topo do arquivo.
-    Cada linha deve ter o formato: ("nome_do_arquivo.bmp", valor_real_esperado)
-    Exemplo: ("128.bmp", 128) - será processada e o resultado comparado com 128 grãos esperados.
+2. 📚 Pra adicionar mais imagens nos testes, basta editar a lista IMAGES
+    no topo do arquivo.
 
-3. 
-        
+    Formato:
+        ("nome.bmp", quantidade_real)
+
+    Exemplo:
+        ("128.bmp", 128)
+
+3. 🔬 O algoritmo funciona como uma pipeline de processamento de imagem,
+    onde vários tratamentos são aplicados em sequência.
+
+    Etapas principais:
+
+    ✓ Detecção de bordas usando gradiente (Sobel)
+    ✓ Remoção de ruídos usando morfologia matemática
+    ✓ Criação de máscaras por regiões conectadas
+    ✓ Binarização local adaptativa por blob
+    ✓ Análise estatística das áreas detectadas
+    ✓ Estimativa da quantidade de grãos por proporção de área
+
+4. 🎯 A binarização NÃO usa apenas threshold simples global.
+
+    Primeiro detectamos mudanças abruptas de intensidade
+    (bordas do arroz) usando gradientes.
+
+    Isso ajuda a eliminar:
+
+    ✗ Reflexos suaves
+    ✗ Degradês de iluminação
+    ✗ Variações leves de claridade
+    ✗ Pequenos ruídos do fundo
+
+5. 📏 A contagem final é feita usando estatística das áreas.
+
+    Como alguns grãos podem estar encostados, o algoritmo estima
+    a área típica de um único grão e usa isso para decidir quando
+    um blob provavelmente representa 2 ou mais grãos conectados.
+
+6. 🧠 A estimativa da área típica é robusta contra blobs grandes.
+
+    O algoritmo descarta iterativamente regiões muito grandes,
+    evitando que grupos de grãos conectados distorçam a média.
+
 """
 
 from pathlib import Path
@@ -20,607 +58,437 @@ import cv2
 import numpy as np
 
 
-# Define de parâmetros
-BLOCKSIZE = 11
-OFFSET = -19
+# Parâmetros
 MIN_AREA = 30
-
-# Debug - mostrar imagens intermediárias durante o processamento
-SHOW_DEBUG = False
 
 # Lista de imagens para testes
 IMAGES = [
-    ("60.bmp", 60),
-    ("82.bmp", 82),
+    ("60.bmp",  60),
+    ("82.bmp",  82),
     ("114.bmp", 114),
     ("150.bmp", 150),
     ("205.bmp", 205),
 ]
 
 
-def binarize(img):
+# ========================================================================================== #
+# Pipeline de processamento 🔬
+
+
+def pipeline(img) -> tuple:
     """
-    Binariza a imagem detectando mudanças ABRUPTAS de intensidade.
-    Isso elimina luzes com degradê suave e detecta bordas do arroz vs fundo.
-    
+    Pipeline completa de detecção e contagem de grãos de arroz.
+
+    Etapas:
+        1. Detecção de bordas por gradiente (Sobel)
+        2. Erosão para remover ruído nas bordas
+        3. Dilatação para criar máscara por região
+        4. Binarização local por blob
+        5. Estimativa da área típica de 1 grão
+        6. Contagem por divisão de área
+
     Args:
-        img: Imagem original em escala BGR
-    
+        img: Imagem original
+
     Returns:
-        Imagem binarizada baseada em gradientes (contornos)
+        Tupla (contagem, binary, edges, eroded, mask)
     """
-    # Converte para escala de cinza
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Suaviza ruído sem destruir as bordas do arroz
+    gray   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges  = detect_edges(img)
+    eroded = erode_edges(edges)
+    mask   = dilate_mask(eroded)
+    binary = local_threshold_by_blob(gray, mask)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    areas = [
+        int(stats[lbl, cv2.CC_STAT_AREA])
+        for lbl in range(1, num_labels)
+        if stats[lbl, cv2.CC_STAT_AREA] >= MIN_AREA
+    ]
+
+    if not areas:
+        return 0, binary, edges, eroded, mask
+
+    single_grain_area = estimate_single_grain_area(areas)
+
+    # cada blob contribui com round(area / area_1_grao) grãos — mínimo 1
+    total = sum(
+        max(1, round(area / single_grain_area))
+        for area in areas
+    )
+
+    return total, binary, edges, eroded, mask
+
+
+# ========================================================================================== #
+# Etapas da pipeline 🔧
+
+
+def detect_edges(img) -> np.ndarray:
+    """
+    Detecta bordas por gradiente de intensidade (Sobel).
+
+    Mudanças abruptas (borda do grão vs fundo) geram alta magnitude.
+    Mudanças suaves (degradê de luz, reflexo) geram baixa magnitude e
+    são eliminadas pelo threshold.
+
+    Args:
+        img: Imagem original (BGR)
+
+    Returns:
+        Imagem binarizada com as bordas detectadas
+    """
+    gray    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
-    
-    # Calcula os gradientes usando Sobel (derivadas em X e Y)
-    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
-    
-    # Calcula a magnitude do gradiente (força da mudança de intensidade)
+
+    sobelx    = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    sobely    = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
     magnitude = cv2.magnitude(sobelx, sobely)
-    
-    # Normaliza para 0-255
     magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
-    
-    # Aplica threshold para detectar apenas mudanças significativas (bordas fortes)
-    # Valores altos = mudanças abruptas (arroz vs fundo)
-    # Valores baixos = mudanças suaves (luzes com degradê)
-    # Threshold de 120: apenas as mudanças mais abruptas são consideradas bordas
+
     _, binary = cv2.threshold(magnitude, 65, 255, cv2.THRESH_BINARY)
-    
-    # Aplica erosão e dilatação para limpar ruído e conectar regiões
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel, iterations=1)
 
     return binary
 
-def count(img):
-    
+
+def erode_edges(edges) -> np.ndarray:
     """
-    Conta os grãos de arroz baseado na área dos blobs brancos.
-
-    Estratégia:
-    - Cada componente conectado branco é analisado
-    - Descobre a área típica de 1 grão
-    - Componentes maiores contam como 2, 3, etc.
-    """
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # ============================================================
-    # BINARIZAÇÃO ORIGINAL
-    # ============================================================
-
-    edges = binarize(img)
-
-    eroded = erode_borders(edges)
-
-    mask = fill_borders(eroded)
-
-    binary = local_binarize_by_mask(gray, mask)
-
-    # limpeza final
-    kernel_final = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (3, 3)
-    )
-
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        kernel_final,
-        iterations=1
-    )
-
-    # ============================================================
-    # COMPONENTES CONECTADOS
-    # ============================================================
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        binary,
-        connectivity=8
-    )
-
-    areas = []
-
-    for lbl in range(1, num_labels):
-
-        area = int(stats[lbl, cv2.CC_STAT_AREA])
-
-        if area >= MIN_AREA:
-            areas.append(area)
-
-    if len(areas) == 0:
-        return 0, binary, edges, eroded, mask
-
-    # ============================================================
-    # ÁREA TÍPICA DE 1 ARROZ
-    # ============================================================
-
-    areas_arr = np.array(areas, dtype=np.float32)
-
-    # usa os menores blobs como referência
-    percentile_60 = np.percentile(areas_arr, 60)
-
-    small_areas = areas_arr[
-        areas_arr <= percentile_60
-    ]
-
-    if len(small_areas) > 0:
-        typical_area = np.median(small_areas)
-    else:
-        typical_area = np.median(areas_arr)
-
-    typical_area = max(typical_area, 1.0)
-
-    # ============================================================
-    # CONTAGEM
-    # ============================================================
-
-    total = 0
-
-    for lbl in range(1, num_labels):
-
-        area = int(stats[lbl, cv2.CC_STAT_AREA])
-
-        if area < MIN_AREA:
-            continue
-
-        # estima quantos arrozes existem nesse blob
-        estimate = round(area / typical_area)
-
-        # mínimo 1
-        estimate = max(1, estimate)
-
-        total += estimate
-
-    return total, binary, edges, eroded, mask
-def fill_borders(edges):
-    """
-    Dilata as bordas para criar uma máscara por blob.
+    Erode as bordas detectadas para remover ruídos pequenos e fragmentos isolados.
 
     Args:
-        edges: Imagem binarizada com as bordas (contornos)
+        edges: Imagem binarizada com bordas detectadas
 
     Returns:
-        Máscara dilatada com os blobs unidos o suficiente para a análise local
-    """
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    filled = cv2.dilate(edges, kernel, iterations=1)
-    filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return filled
-
-
-def erode_borders(edges):
-    """
-    Aplica erosão nas bordas para limpar ruídos e peças pequenas.
-
-    Args:
-        edges: Imagem binarizada com as bordas (contornos)
-
-    Returns:
-        Imagem erodida (ruídos removidos)
+        Imagem erodida
     """
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    eroded = cv2.erode(edges, kernel, iterations=1)
-    return eroded
+    return cv2.erode(edges, kernel, iterations=1)
 
 
-def local_binarize_by_mask(gray, mask):
+def dilate_mask(edges) -> np.ndarray:
     """
-    Binariza localmente cada blob branco da máscara usando a imagem gray original.
-    O limiar de cada blob é calculado como media + desvio padrao.
+    Dilata as bordas erodidas para criar regiões fechadas (máscara por blob).
+
+    Cada blob resultante engloba aproximadamente um grão ou grupo de grãos
+    colados, e será usado como região de interesse para a binarização local.
+
+    Args:
+        edges: Imagem erodida com bordas
+
+    Returns:
+        Máscara com blobs dilatados e fechados
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask   = cv2.dilate(edges, kernel, iterations=1)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask
+
+
+def local_threshold_by_blob(gray, mask) -> np.ndarray:
+    """
+    Binariza cada blob da máscara individualmente usando um limiar local.
+
+    O limiar de cada blob é calculado como média + 0.5 × desvio padrão
+    dos pixels originais dentro daquela região. Isso adapta o threshold
+    a variações locais de brilho (ex: grãos mais escuros num canto iluminado).
 
     Args:
         gray: Imagem em escala de cinza original
-        mask: Máscara binária com os blobs brancos separados
+        mask: Máscara binária com os blobs
 
     Returns:
-        Imagem binária final, calculada blob a blob
+        Imagem binária final
     """
-    result = np.zeros_like(gray)
-    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    result       = np.zeros_like(gray)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    for label in range(1, labels_count):
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area < MIN_AREA:
+    for lbl in range(1, num_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] < MIN_AREA:
             continue
 
-        component_mask = cv2.compare(labels, label, cv2.CMP_EQ)
-        mean, stddev = cv2.meanStdDev(gray, mask=component_mask)
-        threshold = float(mean[0][0] + (0.5 * stddev[0][0]))
-        threshold = max(0.0, min(255.0, threshold))
+        blob_mask         = cv2.compare(labels, lbl, cv2.CMP_EQ)
+        mean, stddev      = cv2.meanStdDev(gray, mask=blob_mask)
+        threshold         = float(np.clip(mean[0][0] + 0.5 * stddev[0][0], 0, 255))
 
-        _, local_binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-        local_binary = cv2.bitwise_and(local_binary, component_mask)
-        result = cv2.bitwise_or(result, local_binary)
+        _, local_binary   = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        local_binary      = cv2.bitwise_and(local_binary, blob_mask)
+        result            = cv2.bitwise_or(result, local_binary)
 
     return result
 
 
-def split_large_components_watershed(img_bgr, binary, labels, stats, typical_area, rel_thresh=0.18):
+def estimate_single_grain_area(areas: list[float]) -> float:
     """
-    Tenta separar componentes muito grandes usando watershed com marcas baseadas em picos
+    Estima a área de um único grão de forma iterativa.
+
+    Parte da mediana de todos os blobs e descarta progressivamente os blobs
+    maiores que 1.5x a estimativa atual, convergindo para o tamanho típico
+    de um grão isolado. Usa o percentil 45 para não superestimar a típica
+    quando há muitos blobs grandes (grupos de grãos colados).
 
     Args:
-        img_bgr: imagem BGR original (usada como entrada para watershed)
-        binary: imagem binária atual (0/255)
-        labels: rótulos dos componentes atuais
-        stats: estatísticas dos componentes atuais (output do connectedComponentsWithStats)
-        typical_area: área típica de um grão (float)
-        rel_thresh: fração do máximo da distance transform para considerar picos
+        areas: Lista de áreas dos blobs detectados (em pixels)
 
     Returns:
-        binary_mod: nova imagem binária onde grandes componentes podem ter sido separados
+        Área estimada de um único grão (float, mínimo 1.0)
     """
-    binary_mod = binary.copy()
-    h, w = binary.shape[:2]
+    arr      = np.array(areas, dtype=np.float32)
+    estimate = float(np.median(arr))
 
-    # limite de área para considerar um componente 'grande'
-    large_factor = 1.8
-    for lbl in range(1, stats.shape[0]):
-        area = int(stats[lbl, cv2.CC_STAT_AREA])
-        if area <= int(large_factor * typical_area):
-            continue
+    for _ in range(10):
+        single_grain_candidates = arr[arr <= estimate * 1.5]
 
-        # máscara do componente
-        comp_mask = (labels == lbl).astype('uint8') * 255
+        if len(single_grain_candidates) == 0:
+            break
 
-        # distancia dentro do componente
-        dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
-        if dist.max() <= 0:
-            continue
+        new_estimate = float(np.percentile(single_grain_candidates, 45))
 
-        # detecta picos locais na distância (marcadores para watershed)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        dil = cv2.dilate(dist, k)
-        peaks = (dist == dil) & (dist >= (dist.max() * rel_thresh))
-        peaks_u8 = (peaks.astype('uint8') * 255)
-        peaks_u8 = cv2.morphologyEx(peaks_u8, cv2.MORPH_OPEN, k, iterations=1)
+        if abs(new_estimate - estimate) < 1.0:
+            break
 
-        n_markers, markers = cv2.connectedComponents(peaks_u8)
-        if n_markers <= 1:
-            # não encontrou sementes suficientes para separar
-            continue
+        estimate = new_estimate
 
-        # prepara marcador para watershed: rotulos >0
-        marker_img = np.zeros((h, w), dtype=np.int32)
-        # atribui rótulos dos marcadores (1..n_markers-1)
-        marker_img[peaks_u8 > 0] = markers[peaks_u8 > 0]
-
-        # imagem de entrada para watershed: região da componente recortada sobre o BGR original
-        region = cv2.bitwise_and(img_bgr, img_bgr, mask=comp_mask)
-
-        # watershed modifica marker_img in-place
-        try:
-            cv2.watershed(region, marker_img)
-        except Exception:
-            # fallback: ignora se watershed falhar
-            continue
-
-        # markers > 1 correspondem a regiões separadas (watershed usa -1 para borda)
-        unique_markers = np.unique(marker_img)
-        # ignora -1 e 0
-        new_comp = np.zeros_like(comp_mask)
-        for m in unique_markers:
-            if m <= 0:
-                continue
-            mask_m = (marker_img == m).astype('uint8') * 255
-            # adiciona região separada ao novo componente
-            new_comp = cv2.bitwise_or(new_comp, mask_m)
-
-        # substitui a área do componente original pela nova separação
-        # remove a região antiga e cola a nova
-        binary_mod[comp_mask > 0] = 0
-        binary_mod[new_comp > 0] = 255
-
-    return binary_mod
-
-
-def visualize_gradient_detection(img):
-    """
-    Visualiza o processo de detecção de gradientes (contornos com mudanças abruptas).
-    
-    Args:
-        img: Imagem original em escala BGR
-    
-    Returns:
-        Tupla com (gray, magnitude, binary)
-    """
-    # Converte para escala de cinza
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Suaviza ruído
-    blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
-    
-    # Calcula os gradientes usando Sobel
-    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
-    
-    # Calcula a magnitude do gradiente
-    magnitude = cv2.magnitude(sobelx, sobely)
-    magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
-    
-    # Binariza baseado nos gradientes (threshold 120: mudanças muito abruptas)
-    _, binary = cv2.threshold(magnitude, 120, 255, cv2.THRESH_BINARY)
-    
-    # Morfologia
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    
-    return gray, magnitude, binary
-
+    return max(estimate, 1.0)
 
 
 # ========================================================================================== #
-# Pra deixar explicito dessa vez ☝️
-# Metodos abaixo gerados por IA, pois são apenas para abrir arquivo e comparar resultados
-
-def print_results_table(resultados):
-    """
-    Imprime a tabela de resultados.
-    
-    Args:
-        resultados: Lista com os resultados de cada imagem
-    """
-    print("\n" + "="*80)
-    print(f"{'Arquivo':<15} {'Estimado':>12} {'Real':>12} {'Erro':>12} {'Percentual':>15}")
-    print("="*80)
-    
-    total_error = 0
-    for res in resultados:
-        print(f"{res['arquivo']:<15} {res['estimado']:>12d} {res['real']:>12d} {res['erro']:>+12d} {res['percentual']:>+14.1f}%")
-        total_error += abs(res['erro'])
-    
-    print("="*80)
-    print(f"{'Erro absoluto médio':<41} {total_error / len(resultados):>11.1f}")
-    print("="*80)
+# Visualização 👁️
 
 
-def show_image_pipeline(filename: str, original, binary):
+def show_pipeline_stages(filename: str, original, edges, eroded, mask, binary):
     """
-    Exibe todos os estágios da pipeline de processamento de uma imagem em janelas separadas.
-    
+    Exibe todos os estágios da pipeline em janelas separadas.
+
     Args:
         filename: Nome do arquivo
         original: Imagem original (BGR)
-        binary: Imagem binarizada
+        edges:    Bordas detectadas pelo Sobel
+        eroded:   Bordas após erosão
+        mask:     Máscara dilatada por blob
+        binary:   Binarização local final
     """
-    # Exibe a imagem original
-    cv2.imshow(f"Original - {filename}", original)
-    
-    # Converte a imagem binarizada para BGR para exibição
-    binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"Binarizada - {filename}", binary_bgr)
-    
-    print(f"\n📸 Mostrando {filename}:")
-    print(f"  - Janela 'Original': imagem bruta")
-    print(f"  - Janela 'Binarizada': resultado do processamento")
-    print(f"Pressione qualquer tecla para fechar as janelas e voltar ao menu.")
+    cv2.imshow(f"01 - Original      - {filename}", original)
+    cv2.imshow(f"02 - Bordas        - {filename}", cv2.cvtColor(edges,  cv2.COLOR_GRAY2BGR))
+    cv2.imshow(f"03 - Bordas Erodidas - {filename}", cv2.cvtColor(eroded, cv2.COLOR_GRAY2BGR))
+    cv2.imshow(f"04 - Mascara       - {filename}", cv2.cvtColor(mask,   cv2.COLOR_GRAY2BGR))
+    cv2.imshow(f"05 - Binarizada    - {filename}", cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR))
+
+    print(f"\n🎨 Pipeline completa — {filename}:")
+    print(f"  01 Original       : imagem bruta")
+    print(f"  02 Bordas         : gradiente Sobel binarizado")
+    print(f"  03 Bordas Erodidas: ruídos removidos por erosão")
+    print(f"  04 Mascara        : blobs dilatados para análise local")
+    print(f"  05 Binarizada     : threshold local por blob (média + desvio padrão)")
+    print(f"Pressione qualquer tecla para fechar.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
-def show_filled_borders(filename: str, original, edges, eroded, mask, binary):
+def show_gradient_stages(filename: str, original):
     """
-    Exibe a sequência completa: bordas detectadas -> erodidas -> máscara -> binarização local.
-    
+    Exibe as etapas intermediárias da detecção de bordas por gradiente.
+
     Args:
         filename: Nome do arquivo
         original: Imagem original (BGR)
-        edges: Imagem com as bordas detectadas
-        eroded: Imagem após erosão (ruídos removidos)
-        mask: Máscara dilatada usada na binarização local
-        binary: Binarização local final
     """
-    cv2.imshow(f"01 - Original - {filename}", original)
+    gray    = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
+    sx      = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    sy      = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    mag     = cv2.magnitude(sx, sy)
+    mag     = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
+    _, b    = cv2.threshold(mag, 65, 255, cv2.THRESH_BINARY)
+    k       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    b       = cv2.morphologyEx(b, cv2.MORPH_CLOSE, k, iterations=2)
+    b       = cv2.morphologyEx(b, cv2.MORPH_OPEN,  k, iterations=1)
 
-    edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"02 - Bordas Detectadas - {filename}", edges_bgr)
+    cv2.imshow(f"01 - Original          - {filename}", original)
+    cv2.imshow(f"02 - Escala de Cinza   - {filename}", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
+    cv2.imshow(f"03 - Mapa de Gradientes- {filename}", cv2.cvtColor(mag,  cv2.COLOR_GRAY2BGR))
+    cv2.imshow(f"04 - Bordas Detectadas - {filename}", cv2.cvtColor(b,    cv2.COLOR_GRAY2BGR))
 
-    eroded_bgr = cv2.cvtColor(eroded, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"03 - Bordas Erodidas - {filename}", eroded_bgr)
-
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"04 - Mascara Diluida - {filename}", mask_bgr)
-
-    binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"05 - Binarizacao Local - {filename}", binary_bgr)
-
-    print(f"\n🎨 Binarizacao Local por Blob - {filename}:")
-    print(f"  - Janela '01 Original': imagem bruta")
-    print(f"  - Janela '02 Bordas Detectadas': resposta inicial do detector")
-    print(f"  - Janela '03 Bordas Erodidas': limpa ruídos pequenos")
-    print(f"  - Janela '04 Mascara Diluida': blobs unidos para analise local")
-    print(f"  - Janela '05 Binarizacao Local': threshold por blob usando media + desvio padrao")
-    print(f"Pressione qualquer tecla para fechar as janelas.")
+    print(f"\n🎯 Detecção de gradientes — {filename}:")
+    print(f"  03 Mapa de Gradientes:")
+    print(f"    ✓ Branco = mudanças abruptas (borda do grão)")
+    print(f"    ✗ Preto  = mudanças suaves (reflexos, degradê — eliminados)")
+    print(f"Pressione qualquer tecla para fechar.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
-def show_gradient_pipeline(filename: str, original, gray, magnitude, binary):
+def show_final_binary(filename: str, original, binary):
     """
-    Exibe o processo completo de detecção de gradientes.
-    Mostra: cinza, mapa de gradientes, e resultado binarizado.
-    
+    Exibe apenas a imagem original e a binarização final lado a lado.
+
     Args:
         filename: Nome do arquivo
         original: Imagem original (BGR)
-        gray: Imagem em escala de cinza
-        magnitude: Mapa de gradientes (magnitude do vetor gradiente)
-        binary: Imagem binarizada final
+        binary:   Imagem binarizada final
     """
-    # Exibe a imagem original
-    cv2.imshow(f"01 - Original - {filename}", original)
-    
-    # Exibe a escala de cinza
-    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"02 - Escala de Cinza - {filename}", gray_bgr)
-    
-    # Exibe o mapa de gradientes (forças de mudança)
-    magnitude_bgr = cv2.cvtColor(magnitude, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"03 - Mapa de Gradientes - {filename}", magnitude_bgr)
-    
-    # Exibe a imagem binarizada
-    binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-    cv2.imshow(f"04 - Binarizada (Contornos) - {filename}", binary_bgr)
-    
-    print(f"\n🎯 Detecção de Gradientes - {filename}:")
-    print(f"  - Janela '01 Original': imagem bruta")
-    print(f"  - Janela '02 Escala de Cinza': conversão inicial")
-    print(f"  - Janela '03 Mapa de Gradientes': mostra força das mudanças de intensidade")
-    print(f"    ✓ Branco = mudanças abruptas (bordas do arroz vs fundo)")
-    print(f"    ✗ Preto = mudanças suaves (degradê das luzes - ELIMINADAS)")
-    print(f"  - Janela '04 Binarizada': contornos finais detectados")
-    print(f"Pressione qualquer tecla para fechar as janelas.")
+    cv2.imshow(f"Original  - {filename}", original)
+    cv2.imshow(f"Binarizada - {filename}", cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR))
+
+    print(f"\n📸 {filename} — pressione qualquer tecla para fechar.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
-def load_image(filename: str):
+# ========================================================================================== #
+# Utilitários 🛠️
+# Métodos abaixo gerados por IA, pois são apenas para abrir arquivo e comparar resultados ☝️
+
+
+def load_image(filename: str) -> np.ndarray:
     """
-    Abre uma imagem BMP e retorna a imagem original.
-    
+    Carrega uma imagem BMP do disco.
+
     Args:
-        filename: Nome do arquivo BMP
-    
+        filename: Caminho do arquivo BMP
+
     Returns:
         Imagem original (BGR)
+
+    Raises:
+        ValueError: Se o arquivo não puder ser lido
     """
-    path = Path(filename)
-    img = cv2.imread(str(path))
-    
+    img = cv2.imread(str(Path(filename)))
     if img is None:
-        raise ValueError(f"{filename}: não conseguiu ler a imagem")
-    
+        raise ValueError(f"{filename}: não foi possível ler a imagem")
     return img
 
-def get_result(estimado: int, real: int) -> dict:
+
+def build_result(estimado: int, real: int) -> dict:
     """
-    Calcula o resultado da estimação.
-    
+    Monta o dicionário de resultado de uma estimativa.
+
     Args:
-        estimado: Valor estimado
-        real: Valor real
-    
+        estimado: Contagem estimada
+        real:     Contagem real esperada
+
     Returns:
         Dict com estimado, real, erro e percentual
     """
     erro = estimado - real
-    percentual = (erro / real * 100) if real > 0 else 0
-    
     return {
-        "estimado": estimado,
-        "real": real,
-        "erro": erro,
-        "percentual": percentual
+        "estimado":   estimado,
+        "real":       real,
+        "erro":       erro,
+        "percentual": (erro / real * 100) if real > 0 else 0.0,
     }
 
+
+def print_results_table(resultados: list):
+    """
+    Imprime a tabela de resultados formatada.
+
+    Args:
+        resultados: Lista de dicts retornados por build_result (com chave 'arquivo')
+    """
+    print("\n" + "=" * 80)
+    print(f"{'Arquivo':<15} {'Estimado':>12} {'Real':>12} {'Erro':>12} {'Percentual':>15}")
+    print("=" * 80)
+
+    total_error = 0
+    for res in resultados:
+        print(
+            f"{res['arquivo']:<15} {res['estimado']:>12d} {res['real']:>12d} "
+            f"{res['erro']:>+12d} {res['percentual']:>+14.1f}%"
+        )
+        total_error += abs(res['erro'])
+
+    print("=" * 80)
+    print(f"{'Erro absoluto médio':<41} {total_error / len(resultados):>11.1f}")
+    print("=" * 80)
+
+
+# ========================================================================================== #
+# Main 🚀
+
+
 def main():
-    """
-    Função principal que processa a lista de imagens.
-    """
     print("Processando imagens...\n")
-    
-    resultados = []
-    images_data = []  # Armazena as imagens processadas
-    
+
+    resultados  = []
+    images_data = []
+
     for filename, real in IMAGES:
         try:
-            # Carrega a imagem
             img = load_image(filename)
-            
-            # Conta os grãos e recebe a imagem binarizada local final
-            contado, binary, edges, eroded, mask = count(img)
-            
-            # Extrai dados para visualização de gradientes
-            gray, magnitude, _ = visualize_gradient_detection(img)
-            
-            # Armazena os dados das imagens
+            contado, binary, edges, eroded, mask = pipeline(img)
+
             images_data.append({
-                "arquivo": filename,
+                "arquivo":  filename,
                 "original": img,
-                "binary": binary,
-                "edges": edges,
-                "eroded": eroded,
-                "mask": mask,
-                "gray": gray,
-                "magnitude": magnitude
+                "binary":   binary,
+                "edges":    edges,
+                "eroded":   eroded,
+                "mask":     mask,
             })
-            
-            # Valida o resultado
-            resultado = get_result(contado, real)
-            resultado['arquivo'] = filename
-            
+
+            resultado             = build_result(contado, real)
+            resultado['arquivo']  = filename
             resultados.append(resultado)
-            
+
         except Exception as exc:
             print(f"Erro processando {filename}: {exc}")
-    
-    # Imprime tabela
+
     print_results_table(resultados)
-    
-    # Pergunta qual imagem visualizar
+
     print("\n📁 Imagens disponíveis para visualização:")
     for i, data in enumerate(images_data):
         print(f"  {i}: {data['arquivo']}")
-    print(f"  table: Mostrar tabela novamente")
-    print(f"  exit: Sair")
-    
+    print("  table : mostrar tabela novamente")
+    print("  exit  : sair")
+
     while True:
         try:
-            choice = input("\n🔍 Qual imagem deseja ver? (0-{}, 'table' ou 'exit'): ".format(len(images_data)-1))
-            
+            choice = input(f"\n🔍 Qual imagem? (0-{len(images_data)-1}, 'table' ou 'exit'): ")
+
             if choice.lower() == "exit":
                 print("👋 Saindo...\n")
                 break
+
             elif choice.lower() == "table":
                 print_results_table(resultados)
+
             else:
                 idx = int(choice)
-                if 0 <= idx < len(images_data):
-                    data = images_data[idx]
-                    print("\n📊 Opções de visualização:")
-                    print("  1: Visualizar resultado final (binarização)")
-                    print("  2: Visualizar processo de detecção de gradientes")
-                    print("  3: Visualizar bordas preenchidas")
-                    
-                    view_choice = input("Escolha (1, 2 ou 3): ").strip()
-                    
-                    if view_choice == "1":
-                        show_image_pipeline(
-                            data['arquivo'],
-                            data['original'],
-                            data['binary']
-                        )
-                    elif view_choice == "2":
-                        show_gradient_pipeline(
-                            data['arquivo'],
-                            data['original'],
-                            data['gray'],
-                            data['magnitude'],
-                            data['binary']
-                        )
-                    elif view_choice == "3":
-                        show_filled_borders(
-                            data['arquivo'],
-                            data['original'],
-                            data['edges'],
-                            data['eroded'],
-                            data['mask'],
-                            data['binary']
-                        )
-                    else:
-                        print("❌ Escolha inválida. Use 1, 2 ou 3.")
+                if not (0 <= idx < len(images_data)):
+                    print(f"❌ Número entre 0 e {len(images_data)-1}")
+                    continue
+
+                data = images_data[idx]
+                print("\n📊 Opções de visualização:")
+                print("  1: Resultado final")
+                print("  2: Etapas do gradiente")
+                print("  3: Pipeline completa")
+
+                view = input("Escolha (1, 2 ou 3): ").strip()
+
+                if view == "1":
+                    show_final_binary(data['arquivo'], data['original'], data['binary'])
+                elif view == "2":
+                    show_gradient_stages(data['arquivo'], data['original'])
+                elif view == "3":
+                    show_pipeline_stages(
+                        data['arquivo'], data['original'],
+                        data['edges'],   data['eroded'],
+                        data['mask'],    data['binary'],
+                    )
                 else:
-                    print(f"❌ Por favor, insira um número entre 0 e {len(images_data)-1}, 'table' ou 'exit'")
+                    print("❌ Use 1, 2 ou 3.")
+
         except ValueError:
-            print("❌ Por favor, insira um número, 'table' ou 'exit'")
+            print("❌ Insira um número, 'table' ou 'exit'")
 
 
 if __name__ == "__main__":
