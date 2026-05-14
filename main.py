@@ -102,6 +102,11 @@ def count(img):
     # Faz a binarização local por blob usando o gray original.
     binary = local_binarize_by_mask(gray, mask)
 
+    # --- Passo final: erosão seguida de dilatação (abertura) para remover restos de ruído ---
+    kernel_final = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.erode(binary, kernel_final, iterations=1)
+    binary = cv2.dilate(binary, kernel_final, iterations=1)
+
     # Encontra contornos e conta grãos.
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     grain_count = sum(1 for c in contours if cv2.contourArea(c) >= MIN_AREA)
@@ -162,7 +167,7 @@ def local_binarize_by_mask(gray, mask):
 
         component_mask = cv2.compare(labels, label, cv2.CMP_EQ)
         mean, stddev = cv2.meanStdDev(gray, mask=component_mask)
-        threshold = float(mean[0][0] + stddev[0][0])
+        threshold = float(mean[0][0] + (0.5 * stddev[0][0]))
         threshold = max(0.0, min(255.0, threshold))
 
         _, local_binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
