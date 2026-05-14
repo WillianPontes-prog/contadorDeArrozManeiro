@@ -78,118 +78,107 @@ def binarize(img):
 
     return binary
 
-def count(img, rel_thresh_override=None, percentile_override=None, alpha_override=None):
+def count(img):
+    
     """
-    Método de contagem de grãos usando máscara dilatada e binarização local.
+    Conta os grãos de arroz baseado na área dos blobs brancos.
 
-    Args:
-        img: Imagem original (BGR)
-
-    Returns:
-        Tupla com (quantidade_de_grãos, binario_local, bordas, erodido, mascara)
+    Estratégia:
+    - Cada componente conectado branco é analisado
+    - Descobre a área típica de 1 grão
+    - Componentes maiores contam como 2, 3, etc.
     """
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Primeiro detecta as bordas base.
+    # ============================================================
+    # BINARIZAÇÃO ORIGINAL
+    # ============================================================
+
     edges = binarize(img)
 
-    # Limpa ruído antes de formar a máscara.
     eroded = erode_borders(edges)
 
-    # A máscara vem da dilatação dos blobs brancos.
     mask = fill_borders(eroded)
 
-    # Faz a binarização local por blob usando o gray original.
     binary = local_binarize_by_mask(gray, mask)
 
-    # --- Passo final: erosão seguida de dilatação (abertura) para remover restos de ruído ---
-    kernel_final = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.erode(binary, kernel_final, iterations=1)
-    binary = cv2.dilate(binary, kernel_final, iterations=1)
+    # limpeza final
+    kernel_final = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (3, 3)
+    )
 
-    # Primeiro calcule áreas por componente para definir área típica
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        kernel_final,
+        iterations=1
+    )
+
+    # ============================================================
+    # COMPONENTES CONECTADOS
+    # ============================================================
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8
+    )
+
     areas = []
+
     for lbl in range(1, num_labels):
-        a = int(stats[lbl, cv2.CC_STAT_AREA])
-        if a >= MIN_AREA:
-            areas.append(a)
+
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+
+        if area >= MIN_AREA:
+            areas.append(area)
 
     if len(areas) == 0:
         return 0, binary, edges, eroded, mask
 
+    # ============================================================
+    # ÁREA TÍPICA DE 1 ARROZ
+    # ============================================================
+
     areas_arr = np.array(areas, dtype=np.float32)
-    pct = 60 if percentile_override is None else int(percentile_override)
-    p60 = np.percentile(areas_arr, pct)
-    small_areas = areas_arr[areas_arr <= p60]
-    if small_areas.size > 0:
-        typical_area = float(np.median(small_areas))
+
+    # usa os menores blobs como referência
+    percentile_60 = np.percentile(areas_arr, 60)
+
+    small_areas = areas_arr[
+        areas_arr <= percentile_60
+    ]
+
+    if len(small_areas) > 0:
+        typical_area = np.median(small_areas)
     else:
-        typical_area = float(np.median(areas_arr))
-    typical_area = max(1.0, typical_area)
-    # threshold relativo usado para detectar picos (semente)
-    rel_thresh = 0.20 if rel_thresh_override is None else float(rel_thresh_override)
+        typical_area = np.median(areas_arr)
 
-    # Distance transform sobre toda a máscara
-    # Antes do distance transform, tente separar componentes muito grandes
-    # usamos uma versão mais sensível do rel_thresh para gerar sementes locais
-    binary = split_large_components_watershed(img, binary, labels, stats, typical_area, rel_thresh=(rel_thresh * 0.6))
+    typical_area = max(typical_area, 1.0)
 
-    bin8 = (binary > 0).astype('uint8') * 255
+    # ============================================================
+    # CONTAGEM
+    # ============================================================
 
-    # Recalcula componentes após possível separação por watershed
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin8, connectivity=8)
-
-    dist = cv2.distanceTransform(bin8, cv2.DIST_L2, 5)
-    maxd = dist.max() if dist.size else 0.0
-
-    # Rel threshold menor para ser mais sensível
-    rel_thresh = 0.20 if rel_thresh_override is None else float(rel_thresh_override)
-    th = maxd * rel_thresh
-
-    kernel_local = np.ones((3, 3), dtype=np.uint8)
-    dil = cv2.dilate(dist, kernel_local)
-    peaks = (dist == dil) & (dist >= th)
-    peaks_u8 = (peaks.astype('uint8') * 255)
-    peaks_u8 = cv2.morphologyEx(peaks_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
-    n_peaks, labels_peaks = cv2.connectedComponents(peaks_u8)
-
-    # Para cada componente da imagem binária, conte sementes dentro dele.
     total = 0
+
     for lbl in range(1, num_labels):
+
         area = int(stats[lbl, cv2.CC_STAT_AREA])
+
         if area < MIN_AREA:
             continue
 
-        comp_mask = (labels == lbl)
+        # estima quantos arrozes existem nesse blob
+        estimate = round(area / typical_area)
 
-        # número de picos nessa componente
-        # labels_peaks tem rótulos para picos; contamos os que estão dentro do comp_mask
-        peaks_in_comp = 0
-        if n_peaks > 1:
-            # para eficiência, somamos onde labels_peaks>0 e comp_mask True
-            peaks_in_comp = int(np.unique(labels_peaks[comp_mask]).shape[0] - (1 if 0 in np.unique(labels_peaks[comp_mask]) else 0))
+        # mínimo 1
+        estimate = max(1, estimate)
 
-        if peaks_in_comp >= 1:
-            total += peaks_in_comp
-        else:
-            # fallback by area (para componentes grandes conectados)
-            est = int(round(area / typical_area))
-            if est < 1:
-                est = 1
-            total += est
+        total += estimate
 
-    # Também calcule uma estimativa global por área e combine
-    total_pixels = float(np.sum(areas_arr))
-    area_estimate = int(round(total_pixels / typical_area))
-
-    # Combina as duas estimativas (sementes e área) usando ponderação alpha
-    alpha = 0.6 if alpha_override is None else float(alpha_override)
-    final_estimate = int(round(alpha * float(total) + (1.0 - alpha) * float(area_estimate)))
-
-    return final_estimate, binary, edges, eroded, mask
-
-
+    return total, binary, edges, eroded, mask
 def fill_borders(edges):
     """
     Dilata as bordas para criar uma máscara por blob.
